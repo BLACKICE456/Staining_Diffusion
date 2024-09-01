@@ -1,5 +1,5 @@
 python train.py
 
-For parallel training using accelerate framework:
+For multiple GPUS training using accelerate framework: \<br>
 accelerate launch train.py
 
