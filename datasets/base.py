@@ -145,10 +145,9 @@ class Dataset(Dataset):
             img2 = cv2.cvtColor(augmented_images[0][2], cv2.COLOR_BGR2RGB)
 
             return [self.to_tensor(img0), self.to_tensor(img1), self.to_tensor(img2)]
-    """
+
     def load_flist(self, flist):
         if isinstance(flist, list):
-            print("1")
             return flist
 
         # flist: image file path, image directory path, text file flist path
@@ -163,19 +162,6 @@ class Dataset(Dataset):
                     return [flist]
 
         return []
-    """
-    
-    def load_flist(self,flist):
-        my_files = os.listdir(flist)
-        #print(flist)
-        path_list = []
-        for file in my_files:
-            path_list.append(flist + "\\" + file)
-            
-        
-        return path_list
-            
-
 
     def cv2equalizeHist(self, img):
         (b, g, r) = cv2.split(img)
