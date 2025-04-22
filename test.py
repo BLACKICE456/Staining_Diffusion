@@ -27,7 +27,7 @@ else:
     sampling_timesteps = 10
     sampling_timesteps_original_ddim_ddpm = 250
     train_num_steps = 300
-
+    training = False
 
 
 
@@ -146,16 +146,25 @@ if __name__ == '__main__':
 
     freeze_support()
 
-    #print(training)
 
-
-    project_name = "RDDM_"
+    project_name = "RDDM_test_draft"
     log_fun = wandb.init(project=project_name,resume = False)
     log_fun.config.update(dict(steps = train_num_steps,scale = sum_scale,train_batch = train_batch_size))
 
-    path_train = '/mnt/data/result_ge47nej/results_translation_train/sample_50_epochs_512_imagesize/model-20.pt'
-    trainer.load(path_train)
-    trainer.train(log_obj = log_fun)
 
+    # test
+
+    for i in range(43,44):
+
+        path = '/mnt/data/result_ge47nej/results_translation_train/sample_50_epochs_512_imagesize' + '/model-' + str(i) +'.pt'
+
+        #print(path)
+        trainer.load(path)
+
+        trainer.set_results_folder(
+                '/mnt/data/result_ge47nej/results_translation_XAI/imagesize_512_1_23' + str(sampling_timesteps))
+        save_heatmap_path ='/mnt/data/result_ge47nej/result_XAI_test/heat_noise_show'
+        saver_result_folder_sample = "/mnt/data/result_ge47nej/results_translation_test/512_imagesize_SFS_sample_checkpoint_44_1024_ablation_noise/"
+        trainer.test(save_heatmap_path = save_heatmap_path,save_result_folder_sample=saver_result_folder_sample,last=False,XAI=False)
 
     log_fun.finish()

@@ -33,12 +33,12 @@ class Dataset(Dataset):
         self.exts = exts
         self.augment_flip = augment_flip
         self.condition = condition
+        #print(self.condition)
         self.crop_patch = crop_patch
         self.sample = sample
         if condition == 1:
             # condition
             self.gt = self.load_flist(folder[0])
-
             self.input = self.load_flist(folder[1])
         elif condition == 0:
             # generation
@@ -53,16 +53,17 @@ class Dataset(Dataset):
 
     def __len__(self):
         if self.condition:
+            #print(len(self.input))
             return len(self.input)
         else:
             return len(self.paths)
 
     def __getitem__(self, index):
+        #print(index)
         if self.condition == 1:
             # condition
             img0 = Image.open(self.gt[index])
             img1 = Image.open(self.input[index])
-            #print(img0)
             w, h = img0.size
             img0 = convert_image_to_fn(
                 self.convert_image_to, img0) if self.convert_image_to else img0
@@ -86,9 +87,10 @@ class Dataset(Dataset):
             augmented_images = next(g)
             img0 = cv2.cvtColor(augmented_images[0][0], cv2.COLOR_BGR2RGB)
             img1 = cv2.cvtColor(augmented_images[0][1], cv2.COLOR_BGR2RGB)
-
-
-            return [self.to_tensor(img0), self.to_tensor(img1)]
+            #print(img0)
+            #print(index)
+            #print(self.to_tensor(img0))
+            return [self.to_tensor(img0), self.to_tensor(img1),index]
         elif self.condition == 0:
             # generation
             path = self.paths[index]
@@ -101,8 +103,9 @@ class Dataset(Dataset):
             if self.crop_patch and not self.sample:
                 img = self.get_patch([img], self.image_size)[0]
 
-            img = self.cv2equalizeHist(img) if self.equalizeHist else img
 
+            img = self.cv2equalizeHist(img) if self.equalizeHist else img
+            print(img)
             images = [[img]]
             p = Augmentor.DataPipeline(images)
             if self.augment_flip:
@@ -148,23 +151,40 @@ class Dataset(Dataset):
             img2 = cv2.cvtColor(augmented_images[0][2], cv2.COLOR_BGR2RGB)
 
             return [self.to_tensor(img0), self.to_tensor(img1), self.to_tensor(img2)]
-
+    """
     def load_flist(self, flist):
-        my_files = os.listdir(flist)
+        if isinstance(flist, list):
+            print("1")
+            return flist
 
+        # flist: image file path, image directory path, text file flist path
+        if isinstance(flist, str):
+            if os.path.isdir(flist):
+                return [p for ext in self.exts for p in Path(f'{flist}').glob(f'**/*.{ext}')]
+
+            if os.path.isfile(flist):
+                try:
+                    return np.genfromtxt(flist, dtype=np.str, encoding='utf-8')
+                except:
+                    return [flist]
+
+        return []
+    """
+    
+    def load_flist(self,flist):
+        my_files = os.listdir(flist)
+        #print(flist)
         path_list = []
-        my_files = ['00116_test_1+.png','00074_test_2+.png','00224_test_2+.png','00103_test_2+.png','00695_test_0.png']
-        #my_files = ['00103_test_2+.png']
         for file in my_files:
             if os.path.isdir(flist + "/" + file):
                 continue
-            #print(file)
-            #print(type(file))
-            #if file == '00396_test_1+.png':
+
             path_list.append(flist + "/" + file)
-
-
+            
+        
         return path_list
+            
+
 
     def cv2equalizeHist(self, img):
         (b, g, r) = cv2.split(img)
@@ -177,14 +197,17 @@ class Dataset(Dataset):
     def to_tensor(self, img):
         img = Image.fromarray(img)  # returns an image object.
         img_t = TF.to_tensor(img).float()
-        #print(img_t)
+        #print(img_t.shape)
         return img_t
 
     def load_name(self, index, sub_dir=False):
         if self.condition:
             # condition
+            #print(index)
             name = self.input[index]
+
             if sub_dir == 0:
+                #print(sub_dir)
                 return os.path.basename(name)
             elif sub_dir == 1:
                 path = os.path.dirname(name)
@@ -220,6 +243,7 @@ class Dataset(Dataset):
                 (block_size if w % block_size != 0 else 0) - w
             img_list[i] = cv2.copyMakeBorder(
                 img, 0, bottom, 0, right, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+            #print(img_list[i].shape)
             i += 1
         return img_list
 

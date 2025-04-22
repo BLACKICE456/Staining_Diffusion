@@ -49,6 +49,12 @@ from tqdm.auto import tqdm
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
+def set_seed(SEED):
+    # initialize random seed
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
 
 def exists(x):
     return x is not None

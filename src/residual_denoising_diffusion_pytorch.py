@@ -1,3 +1,4 @@
+from __future__ import division
 import copy
 import glob
 import math
@@ -26,6 +27,18 @@ from torch.utils.data import DataLoader
 from torchvision import transforms as T
 from torchvision import utils
 from tqdm.auto import tqdm
+from ssim2 import SSIM
+from skimage.metrics import structural_similarity
+from skimage.metrics import peak_signal_noise_ratio
+import matplotlib.pyplot as plt
+import pytorch_fid_wrapper as pfw
+from resnet import *
+from torchvision import transforms
+
+
+from src.utils import stain_utils as stain_utils
+from src.models import stainNorm_Vahadane, stainNorm_Reinhard, stainNorm_Macenko
+
 
 ModelResPrediction = namedtuple(
     'ModelResPrediction', ['pred_res', 'pred_noise', 'pred_x_start'])
@@ -38,6 +51,10 @@ def set_seed(SEED):
     torch.cuda.manual_seed_all(SEED)
     np.random.seed(SEED)
     random.seed(SEED)
+
+def normal_auc(arr):
+    """Returns normalized Area Under Curve of the array."""
+    return (arr.sum() - arr[0] / 2 - arr[-1] / 2) / (arr.shape[0] - 1)
 
 
 def exists(x):
@@ -397,7 +414,7 @@ class Unet(nn.Module):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim=1)
-
+        x = x.float()
         x = self.init_conv(x)
         r = x.clone()
 
@@ -620,6 +637,7 @@ class ResidualDiffusion(nn.Module):
         *,
         image_size,
         timesteps=1000,
+        num_samples = 1,
         sampling_timesteps=None,
         loss_type='l1',
         objective='pred_res_noise',
@@ -635,7 +653,7 @@ class ResidualDiffusion(nn.Module):
         assert not (
             type(self) == ResidualDiffusion and model.channels != model.out_dim)
         assert not model.random_or_learned_sinusoidal_cond
-
+        self.num_samples = num_samples
         self.model = model
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
@@ -1004,158 +1022,10 @@ class ResidualDiffusion(nn.Module):
                 img_list = [img]
             return unnormalize_to_zero_to_one(img_list)
 
-    # @torch.no_grad()
-    # def ddim_sample(self, x_input, shape, last=True):
-    #     if self.input_condition:
-    #         x_input_condition = x_input[1]
-    #     else:
-    #         x_input_condition = 0
-    #     x_input = x_input[0]
 
-    #     batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
-    #         0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
-
-    #     # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-    #     times = torch.linspace(-1, total_timesteps - 1,
-    #                            steps=sampling_timesteps + 1)
-    #     times = list(reversed(times.int().tolist()))
-    #     # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-    #     time_pairs = list(zip(times[:-1], times[1:]))
-
-    #     if self.condition:
-    #         img = x_input+math.sqrt(self.sum_scale) * \
-    #             torch.randn(shape, device=device)
-    #         input_add_noise = img
-    #     else:
-    #         img = torch.randn(shape, device=device)
-
-    #     x_start = None
-    #     type = "use_pred_noise"
-
-    #     if not last:
-    #         img_list = []
-
-    #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-    #         time_cond = torch.full(
-    #             (batch,), time, device=device, dtype=torch.long)
-    #         self_cond = x_start if self.self_condition else None
-    #         preds = self.model_predictions(
-    #             x_input, img, time_cond, x_input_condition, self_cond)
-
-    #         pred_res = preds.pred_res
-    #         pred_noise = preds.pred_noise
-    #         x_start = preds.pred_x_start
-
-    #         if time_next < 0:
-    #             img = x_start
-    #             if not last:
-    #                 img_list.append(img)
-    #             continue
-
-    #         alpha_cumsum = self.alphas_cumsum[time]
-    #         alpha_cumsum_next = self.alphas_cumsum[time_next]
-    #         alpha = alpha_cumsum-alpha_cumsum_next
-
-    #         betas2_cumsum = self.betas2_cumsum[time]
-    #         betas2_cumsum_next = self.betas2_cumsum[time_next]
-    #         betas2 = betas2_cumsum-betas2_cumsum_next
-    #         betas = betas2.sqrt()
-    #         betas_cumsum = self.betas_cumsum[time]
-    #         betas_cumsum_next = self.betas_cumsum[time_next]
-    #         sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
-    #         sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-    #             betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
-
-    #         if eta == 0:
-    #             noise = 0
-    #         else:
-    #             noise = torch.randn_like(img)
-
-    #         if type == "use_pred_noise":
-    #             img = img - alpha*pred_res + sigma2.sqrt()*noise
-    #         elif type == "use_x_start":
-    #             img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-    #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-    #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-    #                 sigma2.sqrt()*noise
-    #         elif type == "special_eta_0":
-    #             img = img - alpha*pred_res - \
-    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
-    #         elif type == "special_eta_1":
-    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
-    #         if not last:
-    #             img_list.append(img)
-
-    #     for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-    #         time_cond = torch.full(
-    #             (batch,), time, device=device, dtype=torch.long)
-    #         self_cond = x_start if self.self_condition else None
-    #         preds = self.model_predictions(
-    #             x_input, img, time_cond, x_input_condition, self_cond)
-
-    #         pred_res = preds.pred_res
-    #         pred_noise = preds.pred_noise
-    #         x_start = preds.pred_x_start
-
-    #         if time_next < 0:
-    #             img = x_start
-    #             if not last:
-    #                 img_list.append(img)
-    #             continue
-
-    #         alpha_cumsum = self.alphas_cumsum[time]
-    #         alpha_cumsum_next = self.alphas_cumsum[time_next]
-    #         alpha = alpha_cumsum-alpha_cumsum_next
-
-    #         betas2_cumsum = self.betas2_cumsum[time]
-    #         betas2_cumsum_next = self.betas2_cumsum[time_next]
-    #         betas2 = betas2_cumsum-betas2_cumsum_next
-    #         betas = betas2.sqrt()
-    #         betas_cumsum = self.betas_cumsum[time]
-    #         betas_cumsum_next = self.betas_cumsum[time_next]
-    #         sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
-    #         sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-    #             betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
-
-    #         if eta == 0:
-    #             noise = 0
-    #         else:
-    #             noise = torch.randn_like(img)
-
-    #         if type == "use_pred_noise":
-    #             img = img - (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
-    #                 pred_noise + sigma2.sqrt()*noise
-    #         elif type == "use_x_start":
-    #             img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-    #                 (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-    #                 (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-    #                 sigma2.sqrt()*noise
-    #         elif type == "special_eta_0":
-    #             img = img - alpha*pred_res - \
-    #                 (betas_cumsum-betas_cumsum_next)*pred_noise
-    #         elif type == "special_eta_1":
-    #             img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
-    #                 betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
-
-    #         if not last:
-    #             img_list.append(img)
-
-    #     if self.condition:
-    #         if not last:
-    #             img_list = [input_add_noise]+img_list
-    #         else:
-    #             img_list = [input_add_noise, img]
-    #         return unnormalize_to_zero_to_one(img_list)
-    #     else:
-    #         if not last:
-    #             img_list = img_list
-    #         else:
-    #             img_list = [img]
-    #         return unnormalize_to_zero_to_one(img_list)
 
     @torch.no_grad()
-    def ddim_sample(self, x_input, shape, last=True):
+    def ddim_sample(self, x_input, shape,file_name=None,last=True,XAI=False):
         if self.input_condition:
             x_input_condition = x_input[1]
         else:
@@ -1186,6 +1056,9 @@ class ResidualDiffusion(nn.Module):
             img_list = []
 
         eta = 0
+        heatmap_list_noise = []
+        auc_list_noise = []
+        auc_noise = None
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full(
@@ -1224,6 +1097,8 @@ class ResidualDiffusion(nn.Module):
             else:
                 noise = torch.randn_like(img)
 
+            input_latent = copy.deepcopy(img)
+            pred_res = 0
             if type == "use_pred_noise":
                 img = img - alpha*pred_res - \
                     (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
@@ -1240,15 +1115,47 @@ class ResidualDiffusion(nn.Module):
                 img = img - alpha*pred_res - betas2/betas_cumsum*pred_noise + \
                     betas*betas2_cumsum_next.sqrt()/betas_cumsum*noise
 
+
+
             if not last:
                 img_list.append(img)
+                #print(len(img_list))
+            img_heat = copy.deepcopy(img)
 
+            if XAI:
+
+
+                heatmap_noise, auc_noise = self.generate_saliency_map(img_heat, input_latent, x_input, time_cond,
+                                                                      x_input_condition, self_cond, mode='all', sim_func='ssim' ,
+                                                                      prob_thresh=0.5, alpha_res= alpha,beta_noise=(betas_cumsum - (betas2_cumsum_next - sigma2).sqrt()), noise_sal=sigma2.sqrt() * noise,get_auc_score=True,auc_mode='ins',file_name=file_name)
+                print("auc_noise:{}".format(auc_noise))
+                heatmap_noise = F.relu(heatmap_noise)
+                heatmap_noise_min, heatmap_noise_max = heatmap_noise.min(), heatmap_noise.max()
+                heatmap_noise = (heatmap_noise - heatmap_noise_min) / (heatmap_noise_max - heatmap_noise_min)
+                heatmap_noise = heatmap_noise.cpu().data
+                heatmap_noise = (heatmap_noise - heatmap_noise.min()).div(heatmap_noise.max() - heatmap_noise.min()).data
+                heatmap_noise = cv2.applyColorMap(np.uint8(255 * heatmap_noise.float()), cv2.COLORMAP_JET)
+                heatmap_noise = torch.from_numpy(heatmap_noise).permute(2, 0, 1).float().div(255)
+                heatmap_noise = ((heatmap_noise - heatmap_noise.min()) / (heatmap_noise.max() - heatmap_noise.min())).unsqueeze(0)
+                #heatmap_noise = F.interpolate(heatmap_noise, size=(512, 512), mode='bicubic', align_corners=False)
+                heatmap_list_noise.append(heatmap_noise)
+
+                auc_list_noise.append(auc_noise)
+
+        img_final_heat = copy.deepcopy(img)
+        heatmap_final = None
+        """
+        heatmap_final, auc_final = self.generate_saliency_map2(img_final_heat, input_latent, x_input, time_cond,
+
+                                                                  x_input_condition, self_cond, mode='all', sim_func='ssim' ,
+                                                                    prob_thresh=0.5, alpha_res= alpha,beta_noise=(betas_cumsum - (betas2_cumsum_next - sigma2).sqrt()), noise_sal=sigma2.sqrt() * noise)
+        """
         if self.condition:
             if not last:
                 img_list = [input_add_noise]+img_list
             else:
                 img_list = [input_add_noise, img]
-            return unnormalize_to_zero_to_one(img_list)
+            return unnormalize_to_zero_to_one(img_list), heatmap_list_noise,auc_noise, heatmap_final
         else:
             if not last:
                 img_list = img_list
@@ -1256,8 +1163,10 @@ class ResidualDiffusion(nn.Module):
                 img_list = [img]
             return unnormalize_to_zero_to_one(img_list)
 
+
+
     @torch.no_grad()
-    def sample(self, x_input=0, batch_size=16, last=True):
+    def sample(self, x_input=0, batch_size=16, last=True, file_name=None,xai=False):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         if self.condition:
@@ -1269,7 +1178,7 @@ class ResidualDiffusion(nn.Module):
             size = (batch_size, channels, h, w)
         else:
             size = (batch_size, channels, image_size, image_size)
-        return sample_fn(x_input, size, last=last)
+        return sample_fn(x_input, size, file_name = file_name, last=last,XAI=xai)
 
     def q_sample(self, x_start, x_res, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -1400,6 +1309,402 @@ class ResidualDiffusion(nn.Module):
 
         return self.p_losses(img, t, *args, **kwargs)
 
+    @torch.no_grad()
+    def generate_saliency_map(
+            self,
+            target_latents,
+            input_latent,
+            x_input,
+            t,
+            x_input_condition,
+            self_cond,
+            mode,
+            rise_num_steps=10,
+            hidden_states=None,
+            prob_thresh=0.5,
+            alpha_res=None,
+            beta_noise=None,
+            noise_sal=None,
+            activation_map=None,
+            sim_func="ssim",
+            layer_vis=False,
+            ssim_mode='structure',
+            get_auc_score=False,
+            auc_mode='del',
+            last=True,
+            file_name=None
+    ):
+
+        if layer_vis:
+            pass
+            """
+            self.unet.down_blocks[2].resnets[1].register_forward_pre_hook(self.preforward_hook)
+            self.activations = dict()
+            input_latents = torch.cat([input_latent] * 2).to("cuda")
+            target_latents = target_latents
+            """
+
+        h, w = target_latents.shape[2:]
+
+
+        res = torch.zeros((h, w), dtype=torch.float32).to(target_latents.device)
+
+        if sim_func == 'cos':
+            score_func = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+        elif sim_func == 'ssim':
+            score_func = SSIM(15, reduction='none', mode=ssim_mode)
+
+        # for step in tqdm(range(rise_num_steps), desc = "Rise iteration..."):
+        # batches = self.num_samples
+        for step in range(rise_num_steps):
+            if not layer_vis:
+                # Activation map version
+                if activation_map is not None:
+                    pass
+                    """
+                    self.mask, masked_latents = self.actv_masking_latents(input_latent, prob_thresh=prob_thresh,
+                                                                          activ=activation_map)
+                    """
+                else:
+                    # Gaussian random masking version
+                    self.mask, masked_latents = self.gau_masking_latents(input_latent, prob_thresh=prob_thresh)
+
+                # masked_latents_input = torch.cat([masked_latents] * 2).to("cuda")
+                masked_latents_input = masked_latents.to("cuda")
+                # masked_pred = self.unet(masked_latents_input, t, encoder_hidden_states=hidden_states).sample
+                preds = self.model_predictions(
+                    x_input, masked_latents_input, t, x_input_condition, self_cond)
+                pred_res = preds.pred_res
+                pred_noise = preds.pred_noise
+                x_start = preds.pred_x_start
+
+                if mode == 'res':
+                    masked_pred = masked_latents_input - alpha_res * pred_res + noise_sal
+
+                elif mode == 'noise':
+                    masked_pred = masked_latents_input - beta_noise * pred_noise + noise_sal
+                elif mode == "all":
+                    masked_pred = masked_latents_input - alpha_res*pred_res - beta_noise * pred_noise + noise_sal
+
+                mask = self.mask
+            else:
+                pass
+                """
+                if activation_map is not None:
+                    self.actv_map = activation_map
+
+                masked_pred = self.unet(input_latent, t, encoder_hidden_states=hidden_states).sample
+                mask = self.mask.unsqueeze(0).unsqueeze(0)
+                mask = F.interpolate(mask, size=(h, w), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+                """
+
+            # Classifier free guidance
+            # masked_noise_pred_uncond, masked_noise_pred_text = masked_pred.chunk(2)
+            # masked_noise_pred_cfg = masked_noise_pred_uncond + self.guidance_scale * (
+            #            masked_noise_pred_text - masked_noise_pred_uncond)
+            masked_noise_pred_cfg = masked_pred
+
+            # #  mask generation
+            # masked_latents = self.scheduler.step(masked_noise_pred_cfg, t, masked_latents, **self.extra_step_kwargs).prev_sample
+            # pred_img = self.decode_latents(masked_latents)
+            # pred = torch.from_numpy(pred_img).permute(0,3,1,2)
+            # if step <20:
+            #     plt.figure('Mask', figsize=(10,4))
+            #     plt.imshow(pred.squeeze(0).permute(1, 2, 0).cpu().numpy())
+            #     plt.axis("off")
+            #     plt.savefig(os.path.join(f"outputs/mask3/mask_{step}.png"))
+            #     # plt.show()
+
+            # #########
+            auc_score = None
+            # print(target_latents)
+            # print(masked_noise_pred_cfg)
+            score = score_func(target_latents, masked_noise_pred_cfg).squeeze(0)
+            # print(score)
+
+            # score = structural_similarity(target_latents, masked_noise_pred_cfg, multichannel=True,channel_axis=1,data_range=1)
+            # print(score)
+
+            res += mask * score
+        res = res
+        if get_auc_score:
+            save_dir = '/mnt/data/result_ge47nej/results_tranlation_test/auc/'
+            auc_score = self.auc_run(auc_mode, input_latent, target_latents,x_input,x_input_condition=x_input_condition, self_cond=self_cond, explanation= res,  t = t, encoder_hidden=hidden_states, alpha_res=alpha_res,beta_noise= beta_noise, noise_sal=noise_sal, random=False,verbose=0, save_to=save_dir,file_name=file_name)
+        else:
+            auc_score = None
+        return res, auc_score
+
+    @torch.no_grad()
+    def generate_saliency_map2(
+            self,
+            target_latents,
+            input_latent,
+            x_input,
+            t,
+            x_input_condition,
+            self_cond,
+            mode,
+            rise_num_steps=10,
+            hidden_states=None,
+            prob_thresh=0.5,
+            alpha_res=None,
+            beta_noise=None,
+            noise_sal=None,
+            activation_map=None,
+            sim_func="ssim",
+            layer_vis=False,
+            ssim_mode='structure',
+            get_auc_score=False,
+            auc_mode='ins',
+            sample_steps = 10,
+            last=True
+    ):
+
+        if layer_vis:
+            pass
+            """
+            self.unet.down_blocks[2].resnets[1].register_forward_pre_hook(self.preforward_hook)
+            self.activations = dict()
+            input_latents = torch.cat([input_latent] * 2).to("cuda")
+            target_latents = target_latents
+            """
+
+        h, w = target_latents.shape[2:]
+
+        res = torch.zeros((h, w), dtype=torch.float32).to(target_latents.device)
+
+        if sim_func == 'cos':
+            score_func = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+        elif sim_func == 'ssim':
+            score_func = SSIM(15, reduction='none', mode=ssim_mode)
+
+        # for step in tqdm(range(rise_num_steps), desc = "Rise iteration..."):
+        # batches = self.num_samples
+        for step in range(rise_num_steps):
+            if not layer_vis:
+                # Activation map version
+                if activation_map is not None:
+                    pass
+                    """
+                    self.mask, masked_latents = self.actv_masking_latents(input_latent, prob_thresh=prob_thresh,
+                                                                          activ=activation_map)
+                    """
+                else:
+                    # Gaussian random masking version
+                    self.mask, masked_latents = self.gau_masking_latents(input_latent, prob_thresh=prob_thresh)
+                image_size, channels = self.image_size, self.channels
+                #sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+
+                batch_size, channels, h, w = x_input.shape
+                size = (batch_size, channels, h, w)
+                # masked_latents_input = torch.cat([masked_latents] * 2).to("cuda")
+                masked_latents_input = masked_latents.to("cuda")
+                # masked_pred = self.unet(masked_latents_input, t, encoder_hidden_states=hidden_states).sample
+
+                #preds = self.model_predictions(
+                #        x_input, masked_latents_input, t, x_input_condition, self_cond)
+                input_add_noise,img = self.ddim_sample2(masked_latents_input, size, last=True)
+
+
+
+                mask = self.mask
+            else:
+                pass
+                """
+                if activation_map is not None:
+                    self.actv_map = activation_map
+
+                masked_pred = self.unet(input_latent, t, encoder_hidden_states=hidden_states).sample
+                mask = self.mask.unsqueeze(0).unsqueeze(0)
+                mask = F.interpolate(mask, size=(h, w), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+                """
+
+            # Classifier free guidance
+            # masked_noise_pred_uncond, masked_noise_pred_text = masked_pred.chunk(2)
+            # masked_noise_pred_cfg = masked_noise_pred_uncond + self.guidance_scale * (
+            #            masked_noise_pred_text - masked_noise_pred_uncond)
+            masked_noise_pred_cfg = img
+
+            # #  mask generation
+            # masked_latents = self.scheduler.step(masked_noise_pred_cfg, t, masked_latents, **self.extra_step_kwargs).prev_sample
+            # pred_img = self.decode_latents(masked_latents)
+            # pred = torch.from_numpy(pred_img).permute(0,3,1,2)
+            # if step <20:
+            #     plt.figure('Mask', figsize=(10,4))
+            #     plt.imshow(pred.squeeze(0).permute(1, 2, 0).cpu().numpy())
+            #     plt.axis("off")
+            #     plt.savefig(os.path.join(f"outputs/mask3/mask_{step}.png"))
+            #     # plt.show()
+
+            # #########
+            auc_score = None
+
+            score = score_func(target_latents, masked_noise_pred_cfg).squeeze(0)
+
+
+            # score = structural_similarity(target_latents, masked_noise_pred_cfg, multichannel=True,channel_axis=1,data_range=1)
+
+            res += mask * score
+        res = res
+        if get_auc_score:
+            auc_score = self.auc_run(auc_mode, input_latent, target_latents, res, t, hidden_states, random=False,
+                                     verbose=0, save_to="outputs/auc")
+        else:
+            auc_score = None
+        return res, auc_score
+
+    @torch.no_grad()
+    def auc_run(self, mode, input_latent, target_pred, x_input,x_input_condition, self_cond,explanation, t, encoder_hidden,alpha_res, beta_noise, noise_sal,random=False, verbose=1,
+                stride=None, save_to=None, last=True,file_name=None):
+        cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+        if stride == None:
+            stride = input_latent.shape[-1]
+        n_steps = (input_latent.shape[-1] ** 2 + stride - 1) // stride
+
+        saliency_map = F.relu(explanation).unsqueeze(0).unsqueeze(0)
+        saliency_map_min, saliency_map_max = saliency_map.min(), saliency_map.max()
+        # normalization
+        saliency_map = (saliency_map - saliency_map_min) / (saliency_map_max - saliency_map_min)
+
+        assert mode in ['del', 'ins', 'noise']
+        if mode == 'del':
+            substrate_fn = torch.zeros_like
+            # substrate_fn = torch.rand_like
+            # substrate_fn = torch.from_numpy(np.random.uniform(0, 1, size=(input_latent.shape[-1], input_latent.shape[-1])))
+        elif mode == 'ins':
+            klen = 11
+            ksig = 5
+            kern = gkern(klen, ksig).cuda()
+            substrate_fn = lambda x: torch.nn.functional.conv2d(x, kern, padding=klen // 2).cuda()
+        elif mode == 'noise':
+            substrate_fn = torch.from_numpy(np.random.uniform(0, 1, size=input_latent.shape))
+
+        if mode == 'del':
+            title = 'Deletion game'
+            ylabel = 'Pixels deleted'
+            start = input_latent.clone()
+            finish = substrate_fn(input_latent)
+        elif mode == 'ins':
+            title = 'Insertion game'
+            ylabel = 'Pixels inserted'
+            start = substrate_fn(input_latent)
+            finish = input_latent.clone()
+        elif mode == 'noise':
+            title = 'Noising game'
+            ylabel = 'Pixels noised'
+            start = input_latent.clone()
+            finish = substrate_fn
+
+        scores = np.empty(n_steps + 1)
+
+        pfw.set_config(batch_size=1, device=target_pred.device)
+        h, w = target_pred.shape[2:]
+        target_img = target_pred
+
+        if random:
+            saliency_map = torch.rand_like(saliency_map)
+        explanation = saliency_map.clone().detach().cpu().numpy()
+        salient_order = np.flip(np.argsort(explanation.reshape(-1, n_steps ** 2), axis=1), axis=-1)
+
+        batches = self.num_samples
+        for i in range(n_steps + 1):
+
+            input_latents = start.cuda()
+            #pred = list(self.ema.ema_model.sample(
+            #    input_latents, batch_size=batches, last=last))
+            preds = self.model_predictions(
+                x_input, input_latents, t, x_input_condition, self_cond)
+            pred_res = preds.pred_res
+            pred_noise = preds.pred_noise
+            x_start = preds.pred_x_start
+            pred= input_latents - alpha_res * pred_res - beta_noise * pred_noise + noise_sal
+
+            score = pfw.fid(pred, target_img)
+            #print(score)
+            # score = cos(pred, target_img)
+            scores[i] = score.mean()
+            if i == n_steps:
+                plt.figure(figsize=(10, 5))
+                # plt.title('{} {:.1f}%, P={:.4f}'.format(ylabel, 100 * i / n_steps, scores[i]))
+                if verbose == 0:
+                    # plt.subplot(339)
+
+                    plt.plot(np.arange(i + 1) / n_steps, scores[:i + 1])
+                    # plt.xlim(-0.1, 1.1)
+                    # plt.ylim(, 1.05)
+                    plt.fill_between(np.arange(i + 1) / n_steps, 0, scores[:i + 1], alpha=0.4)
+                    plt.title(title)
+                    plt.xlabel(ylabel)
+                    plt.ylabel("score")
+                    #plt.imshow()
+                    if save_to:
+                        print(save_to + file_name + mode + '_fid.png')
+                        plt.savefig(save_to + file_name + mode + '_fid.png')
+                        plt.close()
+                    else:
+                        plt.show()
+                return scores
+
+            coords = salient_order[:, stride * i:stride * (i + 1)]
+            #print(start.shape)
+            #print(coords.shape)
+            """"
+            start = start.cpu().numpy().reshape(1, 4, n_steps ** 2)
+
+            start[0, :, coords] = finish.cpu().numpy().reshape(1, 4, n_steps ** 2)[0, :, coords]
+            start = torch.from_numpy(start.reshape(1, 4, n_steps, n_steps))
+            """
+            start = start.cpu().numpy().reshape(1, 3, n_steps ** 2)
+
+            start[0, :, coords] = finish.cpu().numpy().reshape(1, 3, n_steps ** 2)[0, :, coords]
+            start = torch.from_numpy(start.reshape(1, 3, n_steps, n_steps))
+            # start.cpu().numpy().reshape(1, 4, n_steps**2)[0, :, coords] = finish.cpu().numpy().reshape(1, 4, n_steps**2)[0, :, coords]
+            # start.cpu().numpy().reshape(-1, n_steps**2)[:, coords] = finish.cpu().numpy().reshape(-1, n_steps**2)[:, coords]
+        return scores
+
+    def gau_masking_latents(self, latents, prob_thresh):
+        channel, image_w, image_h = latents.shape[1:]
+        mask = (np.random.uniform(0, 1, size=(image_w, image_h)) < prob_thresh).astype(np.float32)
+        ltnt = latents.permute(2, 3, 1, 0).squeeze(-1)
+        masked_latent = (ltnt.to(torch.float32) * torch.from_numpy(np.dstack([mask] * channel)).to(ltnt.device))
+        masked_latent = masked_latent.permute(2, 0, 1).unsqueeze(0).to(torch.float16)
+        mask = torch.from_numpy(mask).to(ltnt.device)
+        return mask, masked_latent
+
+    def actv_masking_latents(self, latents, prob_thresh, activ):
+        image_w, image_h = latents.shape[2:]
+
+        actv_pred_uncond, actv_pred_text = activ.data.chunk(2)
+        activations_ = actv_pred_uncond + 0.7 * (actv_pred_text - actv_pred_uncond)
+
+        activation_map = activations_.sum(1).unsqueeze(0)
+        activation_map = F.interpolate(activation_map, size=(image_w, image_h), mode='bilinear', align_corners=False)
+
+        mean = activation_map.mean()
+        dice = np.random.randint(0, 4)
+        if dice == 0:
+            actv_mask = torch.where(activation_map < mean, 1, 0).squeeze(0).squeeze(0).cpu().detach().numpy()
+            mask = np.random.uniform(0, 1, size=(image_w, image_h))
+            mask = mask * actv_mask
+            mask = (mask > 0.1).astype(np.float32)
+
+        elif dice == 1:
+            actv_mask = torch.where(activation_map > mean, 1, 0).squeeze(0).squeeze(0).cpu().detach().numpy()
+            mask = np.random.uniform(0, 1, size=(image_w, image_h))
+            mask = mask * actv_mask
+            mask = (mask > 0.3).astype(np.float32)
+
+        else:
+            mask = (np.random.uniform(0, 1, size=(image_w, image_h)) < prob_thresh).astype(np.float16)
+
+        ltnt = latents.permute(2, 3, 1, 0).squeeze(-1)
+        masked_latent = (ltnt.to(torch.float32) * torch.from_numpy(np.dstack([mask] * 4)).to(ltnt.device))
+        masked_latent = masked_latent.permute(2, 0, 1).unsqueeze(0).to(torch.float16)
+        mask = torch.from_numpy(mask).to(ltnt.device)
+        return mask, masked_latent
+
+
+
 # trainer class
 
 
@@ -1419,7 +1724,7 @@ class Trainer(object):
         adam_betas=(0.9, 0.99),
         save_and_sample_every=1000,
         num_samples=25,
-        results_folder='./results/sample',
+        results_folder='/mnt/data/result_ge47nej/results_translation_train/sample_50_epochs_512_imagesize',
         amp=False,
         fp16=False,
         split_batches=True,
@@ -1429,7 +1734,8 @@ class Trainer(object):
         equalizeHist=False,
         crop_patch=False,
         generation=False,
-        num_unet=2
+        num_unet=2,
+        normalization_method = 2
     ):
         super().__init__()
 
@@ -1444,8 +1750,8 @@ class Trainer(object):
 
         self.model = diffusion_model
 
-        assert has_int_squareroot(
-            num_samples), 'number of samples must have an integer square root'
+        #assert has_int_squareroot(
+        #    num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
 
@@ -1466,6 +1772,7 @@ class Trainer(object):
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
+
                 self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
                                                                                pin_memory=True, num_workers=4)))  # cpu_count()
 
@@ -1481,13 +1788,13 @@ class Trainer(object):
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
+                self.sample_dataloader = DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,pin_memory=True, num_workers=4)
+                self.sample_loader = cycle(self.accelerator.prepare(self.sample_dataloader))  # cpu_count()
 
                 ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
                              convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
-                self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
+                self.train_dataloader = DataLoader(ds, batch_size=train_batch_size,shuffle=True, pin_memory=True, num_workers=4)
+                self.dl = cycle(self.accelerator.prepare(self.train_dataloader))
             elif len(folder) == 6:
                 self.condition_type = 3
                 # test_gt+test_input
@@ -1511,7 +1818,8 @@ class Trainer(object):
                          convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
             self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
                             shuffle=True, pin_memory=True, num_workers=4)))
-
+        self.saample_data_len = len(self.sample_dataloader)
+        self.train_data_len = len(self.train_dataloader)
         # optimizer
 
         # self.opt = Adam(diffusion_model.parameters(),
@@ -1547,6 +1855,22 @@ class Trainer(object):
         device = self.accelerator.device
         self.device = device
 
+        if normalization_method == 0:
+            # Reinhard
+            method = 'Reinhard'
+            self.normalizer = stainNorm_Reinhard.Normalizer()
+        elif normalization_method == 1:
+            # Macenko
+            method = 'Macenko'
+            self.normalizer = stainNorm_Macenko.Normalizer()
+        elif normalization_method == 2:
+            # Vahadane
+            method = 'Vahadane'
+            self.normalizer = stainNorm_Vahadane.Normalizer()
+        else:
+            print('enter valid normalization method (Reinhard [0], Macenko [1], Vahadane [2])')
+            exit()
+
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
             return
@@ -1570,36 +1894,42 @@ class Trainer(object):
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        path = Path(self.results_folder / f'model-{milestone}.pt')
+        #path = Path(self.results_folder / f'model-{milestone}.pt')
+        accelerator = self.accelerator
+        if accelerator.is_main_process:
+            path = Path(milestone)
 
-        if path.exists():
-            data = torch.load(
-                str(path), map_location=self.device)
+            if path.exists():
+                data = torch.load(
+                    str(path), map_location=self.device)
 
-            model = self.accelerator.unwrap_model(self.model)
-            model.load_state_dict(data['model'])
+                model = self.accelerator.unwrap_model(self.model)
+                model.load_state_dict(data["model"])
+                #model = model.half()
 
-            self.step = data['step']
-            if self.num_unet == 1:
-                self.opt0.load_state_dict(data['opt0'])
-            elif self.num_unet == 2:
-                self.opt0.load_state_dict(data['opt0'])
-                self.opt1.load_state_dict(data['opt1'])
-            self.ema.load_state_dict(data['ema'])
 
-            if exists(self.accelerator.scaler) and exists(data['scaler']):
-                self.accelerator.scaler.load_state_dict(data['scaler'])
 
-            print("load model - "+str(path))
+                self.step = data['step']
+                if self.num_unet == 1:
+                    self.opt0.load_state_dict(data['opt0'])
+                elif self.num_unet == 2:
+                    self.opt0.load_state_dict(data['opt0'])
+                    self.opt1.load_state_dict(data['opt1'])
+                self.ema.load_state_dict(data['ema'])
+
+                if exists(self.accelerator.scaler) and exists(data['scaler']):
+                    self.accelerator.scaler.load_state_dict(data['scaler'])
+
+                print("load model - "+str(path))
 
         # self.ema.to(self.device)
 
-    def train(self):
+    def train(self,log_obj=None):
         accelerator = self.accelerator
-
+        iterations = 0
         with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
 
-            while self.step < self.train_num_steps:
+            while self.step <= self.train_num_steps:
 
                 if self.num_unet == 1:
                     total_loss = [0]
@@ -1609,6 +1939,16 @@ class Trainer(object):
                     if self.condition:
                         data = next(self.dl)
                         data = [item.to(self.device) for item in data]
+                        """
+                        if accelerator.is_main_process:
+                            all_images = torch.cat(data)
+                            save_path = '/mnt/data/result_ge47nej/result_XAI_test/heat_noise'
+                            file_name = f'dataset_test_{self.step}.png'
+                            utils.save_image(all_images,
+                                save_path +'/'+ file_name, nrow=4)
+                            print(data)
+                        """
+
                     else:
                         data = next(self.dl)
                         data = data[0] if isinstance(data, list) else data
@@ -1638,16 +1978,17 @@ class Trainer(object):
 
                 accelerator.wait_for_everyone()
 
-                self.step += 1
+
+
                 if accelerator.is_main_process:
                     self.ema.to(self.device)
                     self.ema.update()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         milestone = self.step // self.save_and_sample_every
-                        self.sample(milestone)
+                        #self.sample(milestone)
 
-                        if self.step != 0 and self.step % (self.save_and_sample_every*10) == 0:
+                        if self.step != 0 and self.step % (self.save_and_sample_every) == 0:
                             self.save(milestone)
                             # results_folder = self.results_folder
                             # gen_img = './results/test_timestep_10_' + \
@@ -1657,18 +1998,23 @@ class Trainer(object):
                             # os.system(
                             #     "python fid_and_inception_score.py "+gen_img)
                             # self.set_results_folder(results_folder)
-                if self.num_unet == 1:
-                    pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
-                elif self.num_unet == 2:
-                    pbar.set_description(
-                        f'loss_unet0: {total_loss[0]:.4f},loss_unet1: {total_loss[1]:.4f}')
-                pbar.update(1)
+                    if self.num_unet == 1:
+                        pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
+                    elif self.num_unet == 2:
+                        pbar.set_description(
+                            f'loss_unet0: {total_loss[0]:.4f},loss_unet1: {total_loss[1]:.4f}')
+                    log_obj.log({"loss_unet0": total_loss[0], "loss_unet1": total_loss[1]})
+                    iterations += self.gradient_accumulate_every
+                    if iterations >= self.train_data_len:
+                        #print(iterations, self.train_data_len)
+                        self.step += 1
+                        iterations = 0
+                        pbar.update(1)
 
         accelerator.print('training complete')
 
     def sample(self, milestone, last=True, FID=False):
         self.ema.ema_model.eval()
-
         with torch.no_grad():
             batches = self.num_samples
             if self.condition_type == 0:
@@ -1717,17 +2063,52 @@ class Trainer(object):
         self.ema.ema_model.train()
         return milestone
 
-    def test(self, sample=False, last=True, FID=False):
+    def test(self, save_heatmap_path,save_result_folder_sample,sample=False, last=True, FID=False,XAI= False):
         self.ema.ema_model.init()
         self.ema.to(self.device)
         print("test start")
+        result_folder_heat_noise = save_heatmap_path
+        result_folder_sample = save_result_folder_sample
+        self.set_results_folder2(result_folder_heat_noise)
+        self.set_results_folder2(result_folder_sample)
+        psnr_list = []
+        ssim_list = []
+        predicted_list = []
+        transform = T.Compose([
+            transforms.Resize([224, 224]),  # 将图片统一尺寸
+            # transforms.RandomHorizontalFlip(),
+            # 将图片随机水平翻转，推理时无需增强，保存时用acc做依据，当数据不平衡时用f1 score或roc，补充一个垂直翻转增强，vertical，
+            # 控制图像被数据增强的概率,选择p=0.3，保留最好的model，用resnet评估RDDM生成结果
+            # transforms.ToTensor(),  # 将图片转换为tensor
+            transforms.Normalize(  # 标准化处理—>转换为正态分布，使模型更容易收敛，不需要重新计算
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+        resnet_model = ResNet50(block=ResNetblock, num_classes=2).to(self.device)
+        weight_path = '/mnt/data/result_ge47nej/resnet/ckpt_full_model/model.pth'
+        resnet_model = load(resnet_model, weight_path)
         if self.condition:
+            print(self.condition)
             self.ema.ema_model.eval()
             loader = DataLoader(
                 dataset=self.sample_dataset,
                 batch_size=1)
+            size = len(loader)
             i = 0
+            acc = 0
+            target0 = 0
+            target1 = 0
+            TP = 0
+            TN = 0
+            FP = 0
+            FN = 0
+            auc = 0.
+
+
             for items in loader:
+                #print(items)
                 if self.condition:
                     file_name = self.sample_dataset.load_name(
                         i, sub_dir=self.sub_dir)
@@ -1757,13 +2138,15 @@ class Trainer(object):
                         x_input_sample = x_input_sample[1:]
 
                     if sample:
-                        all_images_list = show_x_input_sample + \
+                        all_images_list= show_x_input_sample + \
                             list(self.ema.ema_model.sample(
                                 x_input_sample, batch_size=batches))
                     else:
-                        all_images_list = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last))
-                        all_images_list = [all_images_list[-1]]
+                        all_images_list_base,heatmap_list,auc_list, heatmap_final = list(self.ema.ema_model.sample(
+                            x_input_sample, batch_size=batches, last=last,file_name = file_name,xai=XAI))
+                        #print(auc_list)
+                        all_images_list = all_images_list_base
+                        all_images_list2 = show_x_input_sample + all_images_list_base
                         if self.crop_patch:
                             k = 0
                             for img in all_images_list:
@@ -1774,31 +2157,139 @@ class Trainer(object):
                                 all_images_list[k] = img
                                 k += 1
 
-                all_images = torch.cat(all_images_list, dim=0)
+                    all_images = torch.cat(all_images_list2, dim=0)
 
-                if last:
-                    nrow = int(math.sqrt(self.num_samples))
-                else:
-                    nrow = all_images.shape[0]
+                    processed_img = transform(all_images_list2[-1])
+                    predicted_label = resnet_model(processed_img)
+                    predicted_list = predicted_label
+                    #print(file_name)
+                    #print(predicted_label)
+                    target_label = file_name.split('\\')[-1].split('.')[0].split('_')[-1][0]
+                    if target_label =='0' or target_label == '1':
+                        target_label = 0
+                        target0 += 1
+                    else:
+                        target_label = 1
+                        target1 += 1
 
-                utils.save_image(all_images, str(
-                    self.results_folder / file_name), nrow=nrow)
-                print("test-save "+file_name)
+                    acc += (predicted_label.argmax(1) == target_label).sum().item()
+
+                    if predicted_label.argmax(1) == target_label == 1:
+
+                        TP += 1
+                    elif predicted_label.argmax(1) == target_label == 0:
+                        TN += 1
+                    elif predicted_label.argmax(1) == 1 and target_label == 0:
+                        FP += 1
+                    else:
+                        FN += 1
+
+                    normalized_img = all_images_list2[-1]
+                    #print(all_images_list2[0],normalized_img)
+                    psnr, ssim = self.evaluate(all_images_list2[0], normalized_img)
+                    psnr_list.append(psnr)
+                    ssim_list.append(ssim)
+                    print("psnr:{},ssim:{}".format(psnr, ssim))
+
+
+
+
+                    if last:
+                        nrow = int(math.sqrt(self.num_samples))
+                    else:
+                        nrow = all_images.shape[0]
+
+                    utils.save_image(all_images, result_folder_sample + str(file_name), nrow=nrow)
+                    print(result_folder_sample + str(file_name))
+                    #print(all_heatmap.shape)
+                    if XAI:
+                        #auc += auc_list
+                        #print("auc_list:{}".format(auc_list))
+                        all_heatmap = torch.cat(heatmap_list, dim=0)
+                        #all_heatmap = heatmap_list[-1]
+                        utils.save_image(all_heatmap,result_folder_heat_noise+"/"+str(file_name),nrow=15)
+                        #print(resize_images.shape)
+                        resize_images = all_images_list_base[-1]
+                        #utils.save_image(resize_images,result_folder_heat_noise+"/"+'resize_'+str(file_name),nrow = nrow)
+                        #utils.save_image(heatmap_final, result_folder_heat_noise + "/" + 'resize_heatmap' + str(file_name), nrow=nrow)
+                        #print(all_images_list[-1].squeeze().permute(1, 2, 0).shape)
+                        cam = self.show_mask_on_image(img=all_images_list[-1].squeeze().permute(1, 2, 0).cpu(),mask=heatmap_list[-1].squeeze().permute(1, 2, 0).cpu())
+                        batchsize, c, h, w = heatmap_list[0].shape
+
+                        # print(heat_res[0].shape)
+                        heat_map_len = len(heatmap_list)
+                        plt.figure(result_folder_heat_noise + '/' + str(file_name), figsize=(h / 100, w / 100),
+                                   dpi=100)
+                        """
+                        for i in range(heat_map_len):
+                            plt.subplot(1, heat_map_len, i + 1)
+                            # print(heat_noise[i].shape)
+                            img = heat_map[i]
+                            # print(img.shape)
+                            img = img.squeeze().permute(1, 2, 0)
+                            # print(img.shape)
+                            plt.imshow(img)
+                            plt.axis("off")
+                        """
+                        """
+                        img = heatmap_list[-1]
+                        img = img.squeeze().permute(1, 2, 0)
+        
+                        plt.imshow(all_images_list[-1].squeeze().permute(1, 2, 0).cpu())
+                        plt.imshow(img.cpu(), alpha=0.2, cmap='coolwarm')
+                        """
+                        #plt.imshow(cam)
+
+                        #plt.savefig(result_folder_heat_noise + '/' + 'plt_cam_' + str(file_name))
+                        print(result_folder_heat_noise + '/' +'plt_cam_'+ str(file_name))
+                    print("test-save "+file_name + result_folder_sample)
         else:
             if FID:
                 self.total_n_samples = 50000
                 img_id = len(glob.glob(f"{self.results_folder}/*"))
                 n_rounds = (self.total_n_samples -
-                            img_id) // self.num_samples+1
+                                    img_id) // self.num_samples+1
             else:
                 n_rounds = 100
             for i in range(n_rounds):
                 if FID:
-                    i = img_id
+                        i = img_id
                 img_id = self.sample(i, last=last, FID=FID)
+
+
+        psnr_mean = np.mean(psnr_list)
+        psnr_std = np.std(psnr_list)
+        ssim_mean = np.mean(ssim_list)
+        ssim_std = np.std(ssim_list)
+        print("psnr_mean:{},psnr_std:{}".format(psnr_mean, psnr_std))
+        print("ssim_mean:{},ssim_std_{}".format(ssim_mean, ssim_std))
+        #print("auc_mean:{}".format(auc_mean))
+
+       # print("avg_deg:{},SFS:{}".format(avg_deg,SFS))
         print("test end")
+    # for overlap heatmap and img
+    def show_mask_on_image(self,img, mask):
+        cam = np.uint8(mask) * 0.5 + np.float32(img)
+
+        cam = cam / np.max(cam)
+        return np.uint8(255 * cam)
 
     def set_results_folder(self, path):
         self.results_folder = Path(path)
         if not self.results_folder.exists():
             os.makedirs(self.results_folder)
+
+    def set_results_folder2(self, path):
+        results_folder = Path(path)
+        if not results_folder.exists():
+            os.makedirs(results_folder)
+
+
+    def evaluate(self,img1,img2):
+
+        img1 = img1.squeeze().permute(1,2,0).detach().cpu().numpy()
+        img2 = img2.squeeze().permute(1,2,0).detach().cpu().numpy()
+        print(img1.shape,img2.shape)
+        psnr = peak_signal_noise_ratio(img1,img2)
+        ssim = structural_similarity(img1, img2, multichannel=True,channel_axis=-1,data_range=1)
+        return psnr,ssim
