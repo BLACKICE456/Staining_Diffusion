@@ -1,30 +1,21 @@
 from __future__ import division
-import copy
 import glob
 import math
-import os
 import random
 from collections import namedtuple
 from functools import partial
-from multiprocessing import cpu_count
 from pathlib import Path
-
-import Augmentor
-import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
+
+np.bool = np.bool_
+import cv2
 from accelerate import Accelerator
 from datasets.get_dataset import dataset
 from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
 from ema_pytorch import EMA
-from PIL import Image
-from torch import einsum, nn
-from torch.optim import Adam, RAdam
-from torch.utils.data import DataLoader
-from torchvision import transforms as T
+from torch import einsum
+from torch.optim import RAdam
 from torchvision import utils
 from tqdm.auto import tqdm
 from ssim2 import SSIM
@@ -34,9 +25,10 @@ import matplotlib.pyplot as plt
 import pytorch_fid_wrapper as pfw
 from resnet import *
 from torchvision import transforms
-
-
-from src.utils import stain_utils as stain_utils
+import ssim_loss
+import mxnet as mx
+from mxnet import gluon
+import torch.utils.dlpack as tdl
 from src.models import stainNorm_Vahadane, stainNorm_Reinhard, stainNorm_Macenko
 
 
@@ -1286,9 +1278,23 @@ class ResidualDiffusion(nn.Module):
             return [loss]
         else:
             loss_list = []
+            ssim_loss_ = ssim_loss.SSIM()
             for i in range(len(model_out)):
                 loss = self.loss_fn(model_out[i], target[i], reduction='none')
                 loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
+                img1 = model_out[i].cpu().detach().numpy()
+                img2 = target[i].cpu().detach().numpy()
+                img1 = mx.nd.array(img1)
+                img2 = mx.nd.array(img2)
+
+                loss2 = -ssim_loss_(img1, img2)
+                #ssim_loss2 = loss2.view(b, -1).mean(dim=-1)
+                ssim_loss2 = reduce(loss2, 'b ... -> b (...)', 'mean').mean()
+                device_ = loss.device
+                ssim_loss2 = torch.from_numpy(ssim_loss2.asnumpy()).to(device_)
+                alpha = 0.9
+                loss = alpha * loss + (1 - alpha) * ssim_loss2
+
                 loss_list.append(loss)
             return loss_list
 
@@ -1724,7 +1730,7 @@ class Trainer(object):
         adam_betas=(0.9, 0.99),
         save_and_sample_every=1000,
         num_samples=25,
-        results_folder='/mnt/data/result_ge47nej/results_translation_train/sample_50_epochs_512_imagesize',
+        results_folder='/mnt/data/result_ge47nej/results_translation_train/pred_res_noise_ssim',
         amp=False,
         fp16=False,
         split_batches=True,
@@ -2003,7 +2009,7 @@ class Trainer(object):
                     elif self.num_unet == 2:
                         pbar.set_description(
                             f'loss_unet0: {total_loss[0]:.4f},loss_unet1: {total_loss[1]:.4f}')
-                    log_obj.log({"loss_unet0": total_loss[0], "loss_unet1": total_loss[1]})
+                    #log_obj.log({"loss_unet0": total_loss[0], "loss_unet1": total_loss[1]})
                     iterations += self.gradient_accumulate_every
                     if iterations >= self.train_data_len:
                         #print(iterations, self.train_data_len)
@@ -2199,7 +2205,7 @@ class Trainer(object):
                     else:
                         nrow = all_images.shape[0]
 
-                    utils.save_image(all_images, result_folder_sample + str(file_name), nrow=nrow)
+                    #utils.save_image(all_images, result_folder_sample + str(file_name), nrow=nrow)
                     print(result_folder_sample + str(file_name))
                     #print(all_heatmap.shape)
                     if XAI:
