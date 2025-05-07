@@ -72,8 +72,8 @@ if condition:
          """
 
         img_to_img_translation = True
-    train_batch_size = 2
-    num_samples = 2
+    train_batch_size = 1
+    num_samples = 1
     sum_scale = 1
     image_size = 1024
 
@@ -154,17 +154,17 @@ if __name__ == '__main__':
 
     # test
 
-    for i in range(43,44):
+    for i in range(1,11):
 
-        path = '/mnt/data/result_ge47nej/results_translation_train/sample_50_epochs_512_imagesize' + '/model-' + str(i) +'.pt'
+        path = '/mnt/data/result_ge47nej/results_translation_train/pred_x0' + '/model-' + str(i) +'.pt'
 
         #print(path)
         trainer.load(path)
 
         trainer.set_results_folder(
-                '/mnt/data/result_ge47nej/results_translation_XAI/imagesize_512_1_23' + str(sampling_timesteps))
+                '/mnt/data/result_ge47nej/results_translation_XAI/imagesize_1024_4_25' + str(sampling_timesteps))
         save_heatmap_path ='/mnt/data/result_ge47nej/result_XAI_test/heat_noise_show'
-        saver_result_folder_sample = "/mnt/data/result_ge47nej/results_translation_test/512_imagesize_SFS_sample_checkpoint_44_1024_ablation_noise/"
-        trainer.test(save_heatmap_path = save_heatmap_path,save_result_folder_sample=saver_result_folder_sample,last=False,XAI=False)
+        saver_result_folder_sample = "/mnt/data/result_ge47nej/results_translation_train/pred_res_noise_ssim/"
+        trainer.test(save_heatmap_path = save_heatmap_path,save_result_folder_sample=saver_result_folder_sample,last=True,XAI=False)
 
     log_fun.finish()
