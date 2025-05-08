@@ -23,13 +23,20 @@ from skimage.metrics import structural_similarity
 from skimage.metrics import peak_signal_noise_ratio
 import matplotlib.pyplot as plt
 import pytorch_fid_wrapper as pfw
-from resnet import *
+#from resnet import *
 from torchvision import transforms
-import ssim_loss
+import ssim2 as ssim_loss
 import mxnet as mx
 from mxnet import gluon
 import torch.utils.dlpack as tdl
-from src.models import stainNorm_Vahadane, stainNorm_Reinhard, stainNorm_Macenko
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import copy
+import os
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+#from src.stain_normalization_reinhard_macenko_vahadane_main.models import stainNorm_Vahadane, stainNorm_Reinhard, stainNorm_Macenko
 
 
 ModelResPrediction = namedtuple(
@@ -99,7 +106,6 @@ def unnormalize_to_zero_to_one(img):
         return (img + 1) * 0.5
 
 # small helper modules
-
 
 class Residual(nn.Module):
     def __init__(self, fn):
@@ -1774,7 +1780,8 @@ class Trainer(object):
                 self.condition_type = 1
                 # test_input
                 ds = dataset(folder[-1], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
+                             augment_flip=False, convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist,
+                             crop_patch=crop_patch, sample=True, generation=generation)
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
@@ -1789,11 +1796,13 @@ class Trainer(object):
             elif len(folder) == 4:
                 self.condition_type = 2
                 # test_gt+test_input
-                ds = dataset(folder[2:4], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
+                # ds = dataset(folder[2:4], self.image_size,
+                #              augment_flip=False, convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
                 trian_folder = folder[0:2]
-
-                self.sample_dataset = ds
+                #print(folder[2:4])
+                self.sample_dataset = dataset(folder[2:4], self.image_size,
+                             augment_flip=False, convert_image_to=convert_image_to, condition=1,
+                             equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
                 self.sample_dataloader = DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,pin_memory=True, num_workers=4)
                 self.sample_loader = cycle(self.accelerator.prepare(self.sample_dataloader))  # cpu_count()
 
@@ -1861,21 +1870,21 @@ class Trainer(object):
         device = self.accelerator.device
         self.device = device
 
-        if normalization_method == 0:
-            # Reinhard
-            method = 'Reinhard'
-            self.normalizer = stainNorm_Reinhard.Normalizer()
-        elif normalization_method == 1:
-            # Macenko
-            method = 'Macenko'
-            self.normalizer = stainNorm_Macenko.Normalizer()
-        elif normalization_method == 2:
-            # Vahadane
-            method = 'Vahadane'
-            self.normalizer = stainNorm_Vahadane.Normalizer()
-        else:
-            print('enter valid normalization method (Reinhard [0], Macenko [1], Vahadane [2])')
-            exit()
+        # if normalization_method == 0:
+        #     # Reinhard
+        #     method = 'Reinhard'
+        #     self.normalizer = stainNorm_Reinhard.Normalizer()
+        # elif normalization_method == 1:
+        #     # Macenko
+        #     method = 'Macenko'
+        #     self.normalizer = stainNorm_Macenko.Normalizer()
+        # elif normalization_method == 2:
+        #     # Vahadane
+        #     method = 'Vahadane'
+        #     self.normalizer = stainNorm_Vahadane.Normalizer()
+        # else:
+        #     print('enter valid normalization method (Reinhard [0], Macenko [1], Vahadane [2])')
+        #     exit()
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -2069,210 +2078,191 @@ class Trainer(object):
         self.ema.ema_model.train()
         return milestone
 
-    def test(self, save_heatmap_path,save_result_folder_sample,sample=False, last=True, FID=False,XAI= False):
+    def test(
+            self,
+            result_folder_heat_noise: str,
+            result_folder_sample: str,
+            sample: bool = False,
+            last: bool = True,
+            FID: bool = False,
+            XAI: bool = False
+    ):
         self.ema.ema_model.init()
         self.ema.to(self.device)
-        print("test start")
-        result_folder_heat_noise = save_heatmap_path
-        result_folder_sample = save_result_folder_sample
+        print("Testing started...")
+
         self.set_results_folder2(result_folder_heat_noise)
         self.set_results_folder2(result_folder_sample)
-        psnr_list = []
-        ssim_list = []
-        predicted_list = []
-        transform = T.Compose([
-            transforms.Resize([224, 224]),  # 将图片统一尺寸
-            # transforms.RandomHorizontalFlip(),
-            # 将图片随机水平翻转，推理时无需增强，保存时用acc做依据，当数据不平衡时用f1 score或roc，补充一个垂直翻转增强，vertical，
-            # 控制图像被数据增强的概率,选择p=0.3，保留最好的model，用resnet评估RDDM生成结果
-            # transforms.ToTensor(),  # 将图片转换为tensor
-            transforms.Normalize(  # 标准化处理—>转换为正态分布，使模型更容易收敛，不需要重新计算
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
 
-        resnet_model = ResNet50(block=ResNetblock, num_classes=2).to(self.device)
-        weight_path = '/mnt/data/result_ge47nej/resnet/ckpt_full_model/model.pth'
-        resnet_model = load(resnet_model, weight_path)
-        if self.condition:
-            print(self.condition)
-            self.ema.ema_model.eval()
-            loader = DataLoader(
-                dataset=self.sample_dataset,
-                batch_size=1)
-            size = len(loader)
-            i = 0
-            acc = 0
-            target0 = 0
-            target1 = 0
-            TP = 0
-            TN = 0
-            FP = 0
-            FN = 0
-            auc = 0.
+        psnr_list, ssim_list = [], []
 
+        if not self.condition:
+            return self._test_unconditional(FID, last)
 
-            for items in loader:
-                #print(items)
-                if self.condition:
-                    file_name = self.sample_dataset.load_name(
-                        i, sub_dir=self.sub_dir)
-                    file_name = f'{i}.png' if file_name==None else file_name
-                else:
-                    file_name = f'{i}.png'
-                i += 1
+        self.ema.ema_model.eval()
+        loader = DataLoader(self.sample_dataset, batch_size=1)
+        #print('test data size:', len(loader))
 
-                with torch.no_grad():
-                    batches = self.num_samples
+        for i, items in enumerate(loader):
+            file_name = self._get_filename(i)
+            x_input_sample, show_x_input_sample = self._prepare_input(items)
 
-                    if self.condition_type == 0:
-                        x_input_sample = [0]
-                        show_x_input_sample = []
-                    elif self.condition_type == 1:
-                        x_input_sample = [items.to(self.device)]
-                        show_x_input_sample = x_input_sample
-                    elif self.condition_type == 2:
-                        x_input_sample = [item.to(self.device)
-                                          for item in items]
-                        show_x_input_sample = x_input_sample
-                        x_input_sample = x_input_sample[1:]
-                    elif self.condition_type == 3:
-                        x_input_sample = [item.to(self.device)
-                                          for item in items]
-                        show_x_input_sample = x_input_sample
-                        x_input_sample = x_input_sample[1:]
-
-                    if sample:
-                        all_images_list= show_x_input_sample + \
-                            list(self.ema.ema_model.sample(
-                                x_input_sample, batch_size=batches))
-                    else:
-                        all_images_list_base,heatmap_list,auc_list, heatmap_final = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last,file_name = file_name,xai=XAI))
-                        #print(auc_list)
-                        all_images_list = all_images_list_base
-                        all_images_list2 = show_x_input_sample + all_images_list_base
-                        if self.crop_patch:
-                            k = 0
-                            for img in all_images_list:
-                                pad_size = self.sample_dataset.get_pad_size(i)
-                                _, _, h, w = img.shape
-                                img = img[:, :, 0:h -
-                                          pad_size[0], 0:w-pad_size[1]]
-                                all_images_list[k] = img
-                                k += 1
-
-                    all_images = torch.cat(all_images_list2, dim=0)
-
-                    processed_img = transform(all_images_list2[-1])
-                    predicted_label = resnet_model(processed_img)
-                    predicted_list = predicted_label
-                    #print(file_name)
-                    #print(predicted_label)
-                    target_label = file_name.split('\\')[-1].split('.')[0].split('_')[-1][0]
-                    if target_label =='0' or target_label == '1':
-                        target_label = 0
-                        target0 += 1
-                    else:
-                        target_label = 1
-                        target1 += 1
-
-                    acc += (predicted_label.argmax(1) == target_label).sum().item()
-
-                    if predicted_label.argmax(1) == target_label == 1:
-
-                        TP += 1
-                    elif predicted_label.argmax(1) == target_label == 0:
-                        TN += 1
-                    elif predicted_label.argmax(1) == 1 and target_label == 0:
-                        FP += 1
-                    else:
-                        FN += 1
-
-                    normalized_img = all_images_list2[-1]
-                    #print(all_images_list2[0],normalized_img)
-                    psnr, ssim = self.evaluate(all_images_list2[0], normalized_img)
-                    psnr_list.append(psnr)
-                    ssim_list.append(ssim)
-                    print("psnr:{},ssim:{}".format(psnr, ssim))
-
-
-
-
-                    if last:
-                        nrow = int(math.sqrt(self.num_samples))
-                    else:
-                        nrow = all_images.shape[0]
-
-                    #utils.save_image(all_images, result_folder_sample + str(file_name), nrow=nrow)
-                    print(result_folder_sample + str(file_name))
-                    #print(all_heatmap.shape)
-                    if XAI:
-                        #auc += auc_list
-                        #print("auc_list:{}".format(auc_list))
-                        all_heatmap = torch.cat(heatmap_list, dim=0)
-                        #all_heatmap = heatmap_list[-1]
-                        utils.save_image(all_heatmap,result_folder_heat_noise+"/"+str(file_name),nrow=15)
-                        #print(resize_images.shape)
-                        resize_images = all_images_list_base[-1]
-                        #utils.save_image(resize_images,result_folder_heat_noise+"/"+'resize_'+str(file_name),nrow = nrow)
-                        #utils.save_image(heatmap_final, result_folder_heat_noise + "/" + 'resize_heatmap' + str(file_name), nrow=nrow)
-                        #print(all_images_list[-1].squeeze().permute(1, 2, 0).shape)
-                        cam = self.show_mask_on_image(img=all_images_list[-1].squeeze().permute(1, 2, 0).cpu(),mask=heatmap_list[-1].squeeze().permute(1, 2, 0).cpu())
-                        batchsize, c, h, w = heatmap_list[0].shape
-
-                        # print(heat_res[0].shape)
-                        heat_map_len = len(heatmap_list)
-                        plt.figure(result_folder_heat_noise + '/' + str(file_name), figsize=(h / 100, w / 100),
-                                   dpi=100)
-                        """
-                        for i in range(heat_map_len):
-                            plt.subplot(1, heat_map_len, i + 1)
-                            # print(heat_noise[i].shape)
-                            img = heat_map[i]
-                            # print(img.shape)
-                            img = img.squeeze().permute(1, 2, 0)
-                            # print(img.shape)
-                            plt.imshow(img)
-                            plt.axis("off")
-                        """
-                        """
-                        img = heatmap_list[-1]
-                        img = img.squeeze().permute(1, 2, 0)
-        
-                        plt.imshow(all_images_list[-1].squeeze().permute(1, 2, 0).cpu())
-                        plt.imshow(img.cpu(), alpha=0.2, cmap='coolwarm')
-                        """
-                        #plt.imshow(cam)
-
-                        #plt.savefig(result_folder_heat_noise + '/' + 'plt_cam_' + str(file_name))
-                        print(result_folder_heat_noise + '/' +'plt_cam_'+ str(file_name))
-                    print("test-save "+file_name + result_folder_sample)
-        else:
-            if FID:
-                self.total_n_samples = 50000
-                img_id = len(glob.glob(f"{self.results_folder}/*"))
-                n_rounds = (self.total_n_samples -
-                                    img_id) // self.num_samples+1
+            if sample:
+                all_images_list = show_x_input_sample + list(
+                    self.ema.ema_model.sample(x_input_sample, batch_size=self.num_samples)
+                )
+                raise NotImplementedError("Sample is not implemented yet")
             else:
-                n_rounds = 100
-            for i in range(n_rounds):
-                if FID:
-                        i = img_id
-                img_id = self.sample(i, last=last, FID=FID)
+                all_images_list_base, heatmap_list, _, heatmap_final = self.ema.ema_model.sample(
+                    x_input_sample,
+                    batch_size=self.num_samples,
+                    last=last,
+                    file_name=file_name,
+                    xai=XAI
+                )
+                all_images_list2 = show_x_input_sample + all_images_list_base
+                all_images_list = all_images_list_base
+
+                if self.crop_patch:
+                    self._uncrop(all_images_list, i)
+
+                psnr, ssim = self._evaluate_outputs(all_images_list2, file_name,result_folder_sample)
+                psnr_list.append(psnr)
+                ssim_list.append(ssim)
+
+            if XAI:
+                self._save_xai_outputs(heatmap_list, all_images_list_base, file_name, result_folder_heat_noise)
+            #print(f"Saved test result: {file_name} -> {result_folder_sample}{file_name}")
+
+        self._log_test_metrics(psnr_list, ssim_list)
 
 
-        psnr_mean = np.mean(psnr_list)
-        psnr_std = np.std(psnr_list)
-        ssim_mean = np.mean(ssim_list)
-        ssim_std = np.std(ssim_list)
-        print("psnr_mean:{},psnr_std:{}".format(psnr_mean, psnr_std))
-        print("ssim_mean:{},ssim_std_{}".format(ssim_mean, ssim_std))
-        #print("auc_mean:{}".format(auc_mean))
+    def test_dist(
+            self,
+            result_folder_heat_noise: str,
+            result_folder_sample: str,
+            sample: bool = False,
+            last: bool = True,
+            FID: bool = False,
+            XAI: bool = False
+    ):
+        self.ema.ema_model.init()
+        self.ema.to(self.device)
 
-       # print("avg_deg:{},SFS:{}".format(avg_deg,SFS))
-        print("test end")
+        if dist.get_rank() == 0:
+            print("Distributed testing started...")
+
+        self.set_results_folder2(result_folder_heat_noise)
+        self.set_results_folder2(result_folder_sample)
+
+        psnr_list, ssim_list = [], []
+
+        if not self.condition:
+            if dist.get_rank() == 0:
+                return self._test_unconditional(FID, last)
+            else:
+                return
+
+        self.ema.ema_model.eval()
+        sampler = DistributedSampler(self.sample_dataset, shuffle=False)
+        loader = DataLoader(self.sample_dataset, batch_size=1, sampler=sampler)
+
+        for i, items in enumerate(loader):
+            file_name = self._get_filename(i)
+            x_input_sample, show_x_input_sample = self._prepare_input(items)
+
+            if sample:
+                if dist.get_rank() == 0:
+                    raise NotImplementedError("Sample is not implemented in distributed mode")
+            else:
+                all_images_list_base, heatmap_list, _, heatmap_final = self.ema.ema_model.sample(
+                    x_input_sample,
+                    batch_size=self.num_samples,
+                    last=last,
+                    file_name=file_name,
+                    xai=XAI
+                )
+                all_images_list2 = show_x_input_sample + all_images_list_base
+                all_images_list = all_images_list_base
+
+                if self.crop_patch:
+                    self._uncrop(all_images_list, i)
+
+                psnr, ssim = self._evaluate_outputs(all_images_list2, file_name, result_folder_sample)
+                psnr_list.append(psnr)
+                ssim_list.append(ssim)
+
+                if XAI:
+                    self._save_xai_outputs(heatmap_list, all_images_list_base, file_name, result_folder_heat_noise)
+
+        # Gather metrics across GPUs
+        gathered_psnr = [None for _ in range(dist.get_world_size())]
+        gathered_ssim = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered_psnr, psnr_list)
+        dist.all_gather_object(gathered_ssim, ssim_list)
+
+        if dist.get_rank() == 0:
+            flat_psnr = [v for sublist in gathered_psnr for v in sublist]
+            flat_ssim = [v for sublist in gathered_ssim for v in sublist]
+            self._log_test_metrics(flat_psnr, flat_ssim)
+
+    def _get_filename(self, index):
+        name = self.sample_dataset.load_name(index, sub_dir=self.sub_dir) if self.condition else None
+        return f"{index}.png" if name is None else name
+
+    def _prepare_input(self, items):
+        items = [item.to(self.device) for item in items] if isinstance(items, (list, tuple)) else items.to(self.device)
+
+        if self.condition_type == 0:
+            return [0], []
+        elif self.condition_type == 1:
+            return [items], [items]
+        elif self.condition_type in [2, 3]:
+            return items[1:], items
+        return [items], [items]
+
+    def _uncrop(self, images, index):
+        pad_size = self.sample_dataset.get_pad_size(index)
+        for i in range(len(images)):
+            _, _, h, w = images[i].shape
+            images[i] = images[i][:, :, :h - pad_size[0], :w - pad_size[1]]
+
+    def _evaluate_outputs(self, all_images, file_name, save_path):
+        input_img = all_images[0]
+        output_img = all_images[-1]
+        # save the output_img
+        utils.save_image(output_img, os.path.join(save_path, file_name))
+        psnr, ssim = self.evaluate(input_img, output_img)
+        print(f"{file_name} - PSNR: {psnr:.3f}, SSIM: {ssim:.3f}")
+        return psnr, ssim
+
+    def _save_xai_outputs(self, heatmap_list, image_list, file_name, folder):
+        all_heatmap = torch.cat(heatmap_list, dim=0)
+        utils.save_image(all_heatmap, f"{folder}/{file_name}", nrow=15)
+
+        cam = self.show_mask_on_image(
+            img=image_list[-1].squeeze().permute(1, 2, 0).cpu(),
+            mask=heatmap_list[-1].squeeze().permute(1, 2, 0).cpu()
+        )
+        print(f"XAI saved: {folder}/plt_cam_{file_name}")
+
+    def _log_test_metrics(self, psnr_list, ssim_list):
+        print(f"PSNR Mean: {np.mean(psnr_list):.3f}, Std: {np.std(psnr_list):.3f}")
+        print(f"SSIM Mean: {np.mean(ssim_list):.3f}, Std: {np.std(ssim_list):.3f}")
+        print("Testing complete.")
+
+    def _test_unconditional(self, FID, last):
+        if FID:
+            self.total_n_samples = 50000
+            img_id = len(glob.glob(f"{self.results_folder}/*"))
+            n_rounds = (self.total_n_samples - img_id) // self.num_samples + 1
+        else:
+            n_rounds = 100
+
+        for i in range(n_rounds):
+            if FID:
+                i = img_id
+            self.sample(i, last=last, FID=FID)
     # for overlap heatmap and img
     def show_mask_on_image(self,img, mask):
         cam = np.uint8(mask) * 0.5 + np.float32(img)
@@ -2286,9 +2276,13 @@ class Trainer(object):
             os.makedirs(self.results_folder)
 
     def set_results_folder2(self, path):
-        results_folder = Path(path)
-        if not results_folder.exists():
-            os.makedirs(results_folder)
+        if path is not None:
+            results_folder = Path(path)
+            if not results_folder.exists():
+                os.makedirs(results_folder)
+
+        else:
+            return None
 
 
     def evaluate(self,img1,img2):

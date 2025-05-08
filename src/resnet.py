@@ -375,7 +375,6 @@ if __name__ == '__main__':
         weight_path = '/mnt/data/result_ge47nej/resnet/ckpt_full_model/model2.pth'
         model = load(model,weight_path)
 
-
         #train_path = '/mnt/data/BCI/train/IHC'
         val_path = '/mnt/data/result_ge47nej/results_translation_test/512_imagesize_SFS_sample_checkpoint_44_1024_ablation_step_50'
         #train_dataset = BCI(train_path)
@@ -387,12 +386,7 @@ if __name__ == '__main__':
         #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  # 创建优化器，并设置学习率
         loss_fn = nn.CrossEntropyLoss()  # 创建损失函数
 
-
-
-
         for epoch in range(1):
-
-
             model.eval()
             epoch_test_acc, epoch_test_loss,epoch_test_f1,fpr, tpr, thresholds, P0, P1 = test(test_dl, model, loss_fn)
             p0_c = 0.5840

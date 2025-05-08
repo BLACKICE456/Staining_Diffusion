@@ -38,8 +38,9 @@ class Dataset(Dataset):
         if condition == 1:
             # condition
             self.gt = self.load_flist(folder[0])
-
             self.input = self.load_flist(folder[1])
+            print(folder[1])
+            print('len(self.input)', len(self.input))
         elif condition == 0:
             # generation
             self.paths = self.load_flist(folder)
@@ -153,7 +154,7 @@ class Dataset(Dataset):
         my_files = os.listdir(flist)
 
         path_list = []
-        my_files = ['00116_test_1+.png','00074_test_2+.png','00224_test_2+.png','00103_test_2+.png','00695_test_0.png']
+        #my_files = ['00116_test_1+.png','00074_test_2+.png','00224_test_2+.png','00103_test_2+.png','00695_test_0.png']
         #my_files = ['00103_test_2+.png']
         for file in my_files:
             if os.path.isdir(flist + "/" + file):
